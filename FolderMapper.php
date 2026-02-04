@@ -63,19 +63,18 @@ class FolderMapper {
 			// This is a special folder that must not be shown
 			return !in_array($mailbox['mailbox']->utf8, self::DOVECOT_SIEVE_FOLDERS, true);
 		});
-		return array_map(static function (array $mailbox) use ($account) {
-			return new Folder(
-				$mailbox['mailbox'],
-				$mailbox['attributes'],
-				$mailbox['delimiter'],
-				null,
-			);
-		}, $toPersist);
+		return array_map(static fn (array $mailbox) => new Folder(
+			$mailbox['mailbox'],
+			$mailbox['attributes'],
+			$mailbox['delimiter'],
+			null,
+		), $toPersist);
 	}
 
-	public function createFolder(Horde_Imap_Client_Socket $client,
-		string $name): Folder {
-		$client->createMailbox($name);
+	public function createFolder(Horde_Imap_Client_Socket $client, string $name, array $specialUse = []): Folder {
+		$client->createMailbox($name, [
+			'special_use' => $specialUse,
+		]);
 
 		$list = $client->listMailboxes($name, Horde_Imap_Client::MBOX_ALL_SUBSCRIBED, [
 			'delimiter' => true,
@@ -107,14 +106,22 @@ class FolderMapper {
 	 */
 	public function fetchFolderAcls(array $folders,
 		Horde_Imap_Client_Socket $client): void {
-
-		# $hasAcls = $client->capability->query('ACL');
-		$hasAcls = false;
+		try {
+			$hasAcls = $client->capability->query('ACL');
+		} catch (Horde_Imap_Client_Exception $e) {
+			$this->logger->debug('ACL capability check failed: ' . $e->getMessage());
+			$hasAcls = false;
+		}
 
 		foreach ($folders as $folder) {
 			$acls = null;
 			if ($hasAcls && !in_array('\\noselect', array_map('strtolower', $folder->getAttributes()), true)) {
-				$acls = (string)$client->getMyACLRights($folder->getMailbox());
+				try {
+					$acls = (string)$client->getMyACLRights($folder->getMailbox());
+				} catch (Horde_Imap_Client_Exception $e) {
+					$this->logger->debug('Failed to fetch ACL for mailbox ' . $folder->getMailbox() . ': ' . $e->getMessage());
+					$acls = null;
+				}
 			}
 
 			$folder->setMyAcls($acls);
@@ -130,51 +137,45 @@ class FolderMapper {
 	 * @return MailboxStats[]
 	 */
 	public function getFoldersStatusAsObject(Horde_Imap_Client_Socket $client,
-			array $mailboxes): array {
-
-		$statuses = [];
-
-		foreach ($mailboxes as $mailbox) {
-			// 确保转成字符串
+		array $mailboxes): array {
+		// Filter out null, empty, or invalid mailboxes
+		$validMailboxes = array_filter($mailboxes, function ($mailbox) {
+			if ($mailbox === null) {
+				return false;
+			}
+			// Convert object to string if possible
 			if (is_object($mailbox) && method_exists($mailbox, '__toString')) {
 				$mailbox = (string)$mailbox;
 			}
+			$trimmed = trim((string)$mailbox);
+			return $trimmed !== '' && $trimmed !== '""';
+		});
 
-			// 跳过空的、根 "" 或 null
-			if ($mailbox === null) {
-				continue;
-			}
-			$trim = trim((string)$mailbox);
-			if ($trim === '' || $trim === '""') {
-				continue;
-			}
-
+		$statuses = [];
+		foreach ($validMailboxes as $mailbox) {
 			try {
-				// 对每个邮箱单独请求 STATUS，避免因一个报错导致整组失败
-				$res = $client->status([$mailbox]);
-
-				if (is_array($res)) {
-					$first = reset($res);
-					if (isset($first['messages'], $first['unseen'])) {
-						$statuses[$mailbox] = new MailboxStats(
-							$first['messages'],
-							$first['unseen']
-						);
-					} else {
-						$this->logger->debug('STATUS missing fields for mailbox: ' . $mailbox);
-					}
+				$status = $client->status($mailbox);
+				if (!isset($status['messages'], $status['unseen'])) {
+					throw new ServiceException('Could not fetch stats of mailbox: ' . $mailbox);
 				}
-			} catch (\Horde_Imap_Client_Exception $e) {
-				$this->logger->warning(
-					'Skipping STATUS for mailbox "' . $mailbox . '": ' . $e->getMessage()
+				$statuses[$mailbox] = new MailboxStats(
+					$status['messages'],
+					$status['unseen'],
 				);
-				continue;
+			} catch (ServiceException $e) {
+				$this->logger->warning($e->getMessage(), [
+					'exception' => $e,
+					'mailbox' => $mailbox,
+					'status' => $status ?? null,
+				]);
+			} catch (Horde_Imap_Client_Exception $e) {
+				$this->logger->warning('Failed to fetch status for mailbox: ' . $mailbox, [
+					'exception' => $e,
+				]);
 			}
 		}
-
 		return $statuses;
 	}
-
 
 	/**
 	 * @param Horde_Imap_Client_Socket $client
@@ -229,9 +230,7 @@ class FolderMapper {
 			strtolower(Horde_Imap_Client::SPECIALUSE_TRASH)
 		];
 
-		$attributes = array_map(static function ($n) {
-			return strtolower($n);
-		}, $folder->getAttributes());
+		$attributes = array_map(static fn ($n) => strtolower($n), $folder->getAttributes());
 
 		foreach ($specialUseAttributes as $attr) {
 			if (in_array($attr, $attributes)) {
